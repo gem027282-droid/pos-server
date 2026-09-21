@@ -21,7 +21,10 @@ const dbConfig = {
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0,
-    charset: 'utf8mb4'
+    charset: 'utf8mb4',
+    ssl: (process.env.DB_SSL === 'true' || process.env.DB_PORT == '4000' || (process.env.DB_HOST && process.env.DB_HOST.includes('tidbcloud')))
+        ? { minVersion: 'TLSv1.2', rejectUnauthorized: true }
+        : undefined
 };
 
 const pool = mysql.createPool(dbConfig);
@@ -291,6 +294,69 @@ app.get('/api/v1/sync/products', async (req, res) => {
     } catch (err) {
         console.error('خطأ في جلب المنتجات:', err.message);
         res.status(500).json({ error: 'فشل جلب المنتجات من السيرفر' });
+    }
+});
+
+/**
+ * 4. رفع وتحديث المنتجات من التطبيق إلى السيرفر
+ * POST /api/v1/sync/products
+ */
+app.post('/api/v1/sync/products', async (req, res) => {
+    const products = req.body;
+    if (!Array.isArray(products)) {
+        return res.status(400).json({ error: 'المتوقع مصفوفة من المنتجات' });
+    }
+
+    const connection = await pool.getConnection();
+    const results = [];
+
+    try {
+        for (const p of products) {
+            try {
+                // فحص وجود المنتج مسبقاً بنفس الباركود
+                const [existing] = await connection.query(
+                    'SELECT id FROM products WHERE barcode = ? LIMIT 1',
+                    [p.barcode]
+                );
+
+                let serverId;
+                if (existing.length > 0) {
+                    serverId = existing[0].id;
+                    await connection.query(
+                        `UPDATE products 
+                         SET name = ?, packaging = ?, stock_quantity = ?, cost_price = ?, sale_price = ?, updated_at = NOW() 
+                         WHERE id = ?`,
+                        [p.name, p.packaging || 'حبة', p.stock_quantity || 0, p.cost_price || 0, p.sale_price || 0, serverId]
+                    );
+                } else {
+                    const [insertResult] = await connection.query(
+                        `INSERT INTO products (barcode, name, packaging, stock_quantity, cost_price, sale_price, created_at, updated_at)
+                         VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+                        [p.barcode, p.name, p.packaging || 'حبة', p.stock_quantity || 0, p.cost_price || 0, p.sale_price || 0]
+                    );
+                    serverId = insertResult.insertId;
+                }
+
+                results.push({
+                    local_id: p.local_id,
+                    server_id: serverId,
+                    status: 'SUCCESS',
+                    message: 'تمت مزامنة المنتج بنجاح'
+                });
+            } catch (pErr) {
+                console.error('خطأ في مزامنة منتج:', pErr.message);
+                results.push({
+                    local_id: p.local_id,
+                    server_id: 0,
+                    status: 'ERROR',
+                    message: pErr.message
+                });
+            }
+        }
+
+        res.json(results);
+    } finally {
+        connection.release();
     }
 });
 
